@@ -7,9 +7,6 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   build-windows:
     name: Build (Windows x86_64)
@@ -24,11 +21,7 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      # sha2 的 asm feature 在 Windows MSVC 下需要 NASM 汇编器
-      - name: Install NASM (required for sha2 asm feature)
-        uses: ilammy/setup-nasm@v1
-
-      - name: Cache cargo registry & build
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
@@ -44,7 +37,7 @@ jobs:
           RUSTFLAGS: "-C target-cpu=x86-64-v3"
         run: cargo build --release --target x86_64-pc-windows-msvc
 
-      - name: Upload EXE artifact
+      - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
           name: btc-recovery-rust-windows

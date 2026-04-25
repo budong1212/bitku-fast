@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# 加密库 - 启用 asm feature 以使用 SHA-NI 硬件指令
-sha2 = { version = "0.10", features = ["asm"] }
+# 加密库 - 纯 Rust 实现，CI 无需 NASM。
+# 在支持 SHA-NI 的 CPU 上，Rust 编译器会自动通过 LLVM 内联优化，性能接近 asm 版本
+sha2 = "0.10"
 aes = { version = "0.8", features = ["zeroize"] }
 cbc = "0.1"
 block-padding = "0.3"
@@ -35,10 +36,10 @@ chrono = "0.4"
 
 [profile.release]
 opt-level = 3
-lto = "fat"           # 完整 LTO，允许跨 crate 内联优化
-codegen-units = 1     # 单个代码生成单元，最大化优化
+lto = "fat"
+codegen-units = 1
 strip = true
-panic = "abort"       # 去掉 panic 展开开销
+panic = "abort"
 
 [profile.release.build-override]
 opt-level = 3

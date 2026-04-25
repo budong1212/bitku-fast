@@ -1,0 +1,3 @@
+[build]
+# 启用本机 CPU 所有指令集（AVX2, SHA-NI 等）
+rustflags = ["-C", "target-cpu=native"]

@@ -1,0 +1,44 @@
+[package]
+name = "btc-recovery-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 加密库 - 启用 asm feature 以使用 SHA-NI 硬件指令
+sha2 = { version = "0.10", features = ["asm"] }
+aes = { version = "0.8", features = ["zeroize"] }
+cbc = "0.1"
+block-padding = "0.3"
+
+# 并行处理
+rayon = "1.8"
+crossbeam = "0.8"
+
+# GUI
+eframe = "0.27"
+egui = "0.27"
+egui_extras = "0.27"
+rfd = "0.14"
+
+# 字体支持
+ab_glyph = "0.2"
+
+# 数据库
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# 工具
+anyhow = "1.0"
+thiserror = "1.0"
+memmap2 = "0.9"
+byteorder = "1.5"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"           # 完整 LTO，允许跨 crate 内联优化
+codegen-units = 1     # 单个代码生成单元，最大化优化
+strip = true
+panic = "abort"       # 去掉 panic 展开开销
+
+[profile.release.build-override]
+opt-level = 3

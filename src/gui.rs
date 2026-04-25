@@ -22,11 +22,9 @@ enum AppState {
 struct RunState {
     result: Option<CheckResult>,
     log: Vec<String>,
-    /// 字典总行数（流式扫描后填入，用于 ETA 计算）
     total_count: Option<u64>,
 }
 
-/// 后台任务句柄，持有取消信号和共享进度
 struct TaskHandle {
     cancel_flag: Arc<AtomicBool>,
     progress_count: Arc<AtomicU64>,
@@ -139,7 +137,6 @@ impl RecoveryApp {
         let (tx, rx) = channel::bounded::<Vec<String>>(16);
 
         thread::spawn(move || {
-            // 先统计总行数（用于 ETA），不影响后续流式处理
             if let Ok(f) = std::fs::File::open(&dict_path2) {
                 let total = BufReader::new(f).lines().count() as u64;
                 run_state2.lock().unwrap().total_count = Some(total);
@@ -163,21 +160,25 @@ impl RecoveryApp {
                 if let Ok(l) = line {
                     batch.push(l);
                     if batch.len() >= BATCH_SIZE {
-                        if tx.send(std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE))).is_err() {
+                        if tx
+                            .send(std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)))
+                            .is_err()
+                        {
                             break;
                         }
                     }
                 }
             }
-            // 发送剩余批次
             if !batch.is_empty() {
                 let _ = tx.send(batch);
             }
-            // tx drop 后 rx 会收到断开信号
         });
 
         // ── 计算线程：从 channel 消费并行验证 ────────────────────────────────
         let run_state3 = self.run_state.clone();
+        // 修复 E0382: 提前 clone 两份 ctx，各自独立所有权
+        let ctx_callback = ctx.clone();  // 给进度回调闭包
+        let ctx_finish = ctx;            // 给线程结束时的 repaint
         thread::spawn(move || {
             let checker = PasswordChecker {
                 wallet,
@@ -187,14 +188,13 @@ impl RecoveryApp {
                 start_time: std::time::Instant::now(),
             };
 
-            let result = checker.check_passwords_from_channel(rx, move |count, speed| {
+            let result = checker.check_passwords_from_channel(rx, move |_count, speed| {
                 *ps_clone.lock().unwrap() = speed;
-                let _ = count; // count 已由 checked_count 原子更新
-                ctx.request_repaint();
+                ctx_callback.request_repaint();
             });
 
             run_state3.lock().unwrap().result = Some(result);
-            ctx.request_repaint();
+            ctx_finish.request_repaint();
         });
     }
 }
@@ -301,10 +301,12 @@ impl eframe::App for RecoveryApp {
                         self.start_recovery(ctx.clone());
                     }
 
-                    // 停止按钮
                     if self.state == AppState::Running {
                         if ui
-                            .add(egui::Button::new("⏹ 停止").fill(egui::Color32::from_rgb(180, 50, 50)))
+                            .add(
+                                egui::Button::new("⏹ 停止")
+                                    .fill(egui::Color32::from_rgb(180, 50, 50)),
+                            )
                             .clicked()
                         {
                             if let Some(ref t) = self.task {
@@ -317,9 +319,7 @@ impl eframe::App for RecoveryApp {
                 // 进度显示 + ETA
                 if self.state == AppState::Running {
                     ui.separator();
-                    let rs = self.run_state.lock().unwrap();
-                    let total_opt = rs.total_count;
-                    drop(rs);
+                    let total_opt = self.run_state.lock().unwrap().total_count;
 
                     let speed = self.progress_speed;
                     let count = self.progress_count;
@@ -354,7 +354,6 @@ impl eframe::App for RecoveryApp {
                                     egui::Color32::GREEN,
                                     format!("🎉 找到密码: {}", pw),
                                 );
-                                // 一键复制
                                 if ui.button("📋 复制密码").clicked() {
                                     ui.output_mut(|o| o.copied_text = pw.clone());
                                 }

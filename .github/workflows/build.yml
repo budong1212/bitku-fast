@@ -7,6 +7,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-windows:
     name: Build (Windows x86_64)
@@ -21,6 +24,10 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      # sha2 的 asm feature 在 Windows MSVC 下需要 NASM 汇编器
+      - name: Install NASM (required for sha2 asm feature)
+        uses: ilammy/setup-nasm@v1
+
       - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
@@ -33,8 +40,6 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build release
-        # CI 环境覆盖 target-cpu=native（编译机 CPU 与用户机器不同）
-        # 改用 x86-64-v3：支持 AVX2 的通用指令集，兼顾性能和兼容性
         env:
           RUSTFLAGS: "-C target-cpu=x86-64-v3"
         run: cargo build --release --target x86_64-pc-windows-msvc

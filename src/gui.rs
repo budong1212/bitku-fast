@@ -1,46 +1,52 @@
-// GUI 模块 - 从原仓库直接迁移，功能不变
-// 原始文件见 https://github.com/budong1212/bitku/blob/main/gui.rs
 use crate::password_checker::{CheckResult, PasswordChecker};
 use crate::wallet::BitcoinCoreWallet;
+use crossbeam::channel;
 use eframe::egui;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// 应用状态
+const BATCH_SIZE: usize = 2_000;
+
 #[derive(Debug, Clone, PartialEq)]
 enum AppState {
     Idle,
     Running,
     Finished,
+    Cancelled,
     Error(String),
 }
 
-/// 共享的运行状态
 struct RunState {
     result: Option<CheckResult>,
     log: Vec<String>,
+    /// 字典总行数（流式扫描后填入，用于 ETA 计算）
+    total_count: Option<u64>,
 }
 
-/// 主应用结构体
+/// 后台任务句柄，持有取消信号和共享进度
+struct TaskHandle {
+    cancel_flag: Arc<AtomicBool>,
+    progress_count: Arc<AtomicU64>,
+    progress_speed: Arc<Mutex<f64>>,
+}
+
 pub struct RecoveryApp {
-    // 钱包文件路径
     wallet_path: Option<PathBuf>,
     wallet_info: Option<String>,
     wallet: Option<BitcoinCoreWallet>,
 
-    // 字典文件路径
     dict_path: Option<PathBuf>,
 
-    // 单个密码测试
     test_password: String,
     test_result: Option<bool>,
 
-    // 运行状态
     state: AppState,
     run_state: Arc<Mutex<RunState>>,
+    task: Option<TaskHandle>,
 
-    // 进度显示
     progress_count: u64,
     progress_speed: f64,
 }
@@ -58,20 +64,150 @@ impl RecoveryApp {
             run_state: Arc::new(Mutex::new(RunState {
                 result: None,
                 log: Vec::new(),
+                total_count: None,
             })),
+            task: None,
             progress_count: 0,
             progress_speed: 0.0,
         }
+    }
+
+    fn poll_task_completion(&mut self) {
+        if self.state != AppState::Running {
+            return;
+        }
+        let rs = self.run_state.lock().unwrap();
+        if rs.result.is_some() {
+            drop(rs);
+            let cancelled = self
+                .task
+                .as_ref()
+                .map(|t| t.cancel_flag.load(Ordering::Relaxed))
+                .unwrap_or(false);
+            self.state = if cancelled {
+                AppState::Cancelled
+            } else {
+                AppState::Finished
+            };
+            self.task = None;
+        } else if let Some(ref t) = self.task {
+            self.progress_count = t.progress_count.load(Ordering::Relaxed);
+            self.progress_speed = *t.progress_speed.lock().unwrap();
+        }
+    }
+
+    fn start_recovery(&mut self, ctx: egui::Context) {
+        let wallet = match self.wallet.clone() {
+            Some(w) => w,
+            None => return,
+        };
+        let dict_path = match self.dict_path.clone() {
+            Some(p) => p,
+            None => return,
+        };
+
+        self.state = AppState::Running;
+        self.progress_count = 0;
+        self.progress_speed = 0.0;
+
+        {
+            let mut rs = self.run_state.lock().unwrap();
+            rs.result = None;
+            rs.log.clear();
+            rs.total_count = None;
+        }
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let progress_count = Arc::new(AtomicU64::new(0));
+        let progress_speed = Arc::new(Mutex::new(0.0f64));
+
+        let handle = TaskHandle {
+            cancel_flag: cancel_flag.clone(),
+            progress_count: progress_count.clone(),
+            progress_speed: progress_speed.clone(),
+        };
+        self.task = Some(handle);
+
+        let run_state = self.run_state.clone();
+        let pc_clone = progress_count.clone();
+        let ps_clone = progress_speed.clone();
+        let cancel_clone = cancel_flag.clone();
+        let run_state2 = run_state.clone();
+        let dict_path2 = dict_path.clone();
+
+        // ── IO 线程：流式读取字典，按批发送 ──────────────────────────────────
+        let (tx, rx) = channel::bounded::<Vec<String>>(16);
+
+        thread::spawn(move || {
+            // 先统计总行数（用于 ETA），不影响后续流式处理
+            if let Ok(f) = std::fs::File::open(&dict_path2) {
+                let total = BufReader::new(f).lines().count() as u64;
+                run_state2.lock().unwrap().total_count = Some(total);
+            }
+
+            let file = match std::fs::File::open(&dict_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    run_state.lock().unwrap().log.push(format!("读取字典失败: {}", e));
+                    return;
+                }
+            };
+
+            let reader = BufReader::new(file);
+            let mut batch = Vec::with_capacity(BATCH_SIZE);
+
+            for line in reader.lines() {
+                if cancel_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Ok(l) = line {
+                    batch.push(l);
+                    if batch.len() >= BATCH_SIZE {
+                        if tx.send(std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE))).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            // 发送剩余批次
+            if !batch.is_empty() {
+                let _ = tx.send(batch);
+            }
+            // tx drop 后 rx 会收到断开信号
+        });
+
+        // ── 计算线程：从 channel 消费并行验证 ────────────────────────────────
+        let run_state3 = self.run_state.clone();
+        thread::spawn(move || {
+            let checker = PasswordChecker {
+                wallet,
+                checked_count: pc_clone,
+                found: Arc::new(AtomicBool::new(false)),
+                cancelled: cancel_flag,
+                start_time: std::time::Instant::now(),
+            };
+
+            let result = checker.check_passwords_from_channel(rx, move |count, speed| {
+                *ps_clone.lock().unwrap() = speed;
+                let _ = count; // count 已由 checked_count 原子更新
+                ctx.request_repaint();
+            });
+
+            run_state3.lock().unwrap().result = Some(result);
+            ctx.request_repaint();
+        });
     }
 }
 
 impl eframe::App for RecoveryApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_task_completion();
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("BTC Recovery - 高性能 CPU 优化版");
             ui.separator();
 
-            // --- 钱包加载区 ---
+            // ── 钱包加载区 ────────────────────────────────────────────────────
             ui.group(|ui| {
                 ui.label("📂 钱包文件");
                 ui.horizontal(|ui| {
@@ -93,8 +229,7 @@ impl eframe::App for RecoveryApp {
                                     self.wallet_path = Some(path);
                                 }
                                 Err(e) => {
-                                    self.wallet_info =
-                                        Some(format!("加载失败: {}", e));
+                                    self.wallet_info = Some(format!("加载失败: {}", e));
                                 }
                             }
                         }
@@ -107,7 +242,7 @@ impl eframe::App for RecoveryApp {
 
             ui.add_space(8.0);
 
-            // --- 单密码测试区 ---
+            // ── 单密码测试区 ──────────────────────────────────────────────────
             ui.group(|ui| {
                 ui.label("🔑 测试单个密码");
                 ui.horizontal(|ui| {
@@ -119,8 +254,7 @@ impl eframe::App for RecoveryApp {
                     if btn.clicked() {
                         if let Some(w) = &self.wallet {
                             let checker = PasswordChecker::new(w.clone());
-                            self.test_result =
-                                Some(checker.check_password(&self.test_password));
+                            self.test_result = Some(checker.check_password(&self.test_password));
                         }
                     }
                 });
@@ -135,7 +269,7 @@ impl eframe::App for RecoveryApp {
 
             ui.add_space(8.0);
 
-            // --- 字典攻击区 ---
+            // ── 字典攻击区 ────────────────────────────────────────────────────
             ui.group(|ui| {
                 ui.label("📖 字典攻击");
                 ui.horizontal(|ui| {
@@ -155,28 +289,61 @@ impl eframe::App for RecoveryApp {
                     }
                 });
 
-                let can_start = self.wallet.is_some()
-                    && self.dict_path.is_some()
-                    && self.state != AppState::Running;
+                ui.horizontal(|ui| {
+                    let can_start = self.wallet.is_some()
+                        && self.dict_path.is_some()
+                        && self.state != AppState::Running;
 
-                if ui
-                    .add_enabled(can_start, egui::Button::new("🚀 开始恢复"))
-                    .clicked()
-                {
-                    self.start_recovery(ctx.clone());
-                }
+                    if ui
+                        .add_enabled(can_start, egui::Button::new("🚀 开始恢复"))
+                        .clicked()
+                    {
+                        self.start_recovery(ctx.clone());
+                    }
 
-                // 进度显示
+                    // 停止按钮
+                    if self.state == AppState::Running {
+                        if ui
+                            .add(egui::Button::new("⏹ 停止").fill(egui::Color32::from_rgb(180, 50, 50)))
+                            .clicked()
+                        {
+                            if let Some(ref t) = self.task {
+                                t.cancel_flag.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+
+                // 进度显示 + ETA
                 if self.state == AppState::Running {
                     ui.separator();
+                    let rs = self.run_state.lock().unwrap();
+                    let total_opt = rs.total_count;
+                    drop(rs);
+
+                    let speed = self.progress_speed;
+                    let count = self.progress_count;
+
+                    let eta_str = match total_opt {
+                        Some(total) if speed > 0.0 && total > count => {
+                            let remaining = (total - count) as f64 / speed;
+                            if remaining < 60.0 {
+                                format!("  ETA: {:.0}s", remaining)
+                            } else {
+                                format!("  ETA: {:.1}min", remaining / 60.0)
+                            }
+                        }
+                        _ => String::new(),
+                    };
+
                     ui.label(format!(
-                        "已检查: {}  速度: {:.0} pwd/s",
-                        self.progress_count, self.progress_speed
+                        "已检查: {}  速度: {:.0} pwd/s{}",
+                        count, speed, eta_str
                     ));
                     ctx.request_repaint();
                 }
 
-                // 结果
+                // 结果展示
                 {
                     let rs = self.run_state.lock().unwrap();
                     if let Some(ref r) = rs.result {
@@ -187,21 +354,26 @@ impl eframe::App for RecoveryApp {
                                     egui::Color32::GREEN,
                                     format!("🎉 找到密码: {}", pw),
                                 );
+                                // 一键复制
+                                if ui.button("📋 复制密码").clicked() {
+                                    ui.output_mut(|o| o.copied_text = pw.clone());
+                                }
                             }
                             None => {
-                                ui.colored_label(
-                                    egui::Color32::YELLOW,
-                                    "未找到密码，字典已穷举",
-                                );
+                                let label = if r.cancelled {
+                                    "🟡 任务已取消"
+                                } else {
+                                    "未找到密码，字典已穷举"
+                                };
+                                ui.colored_label(egui::Color32::YELLOW, label);
                             }
                         }
                         ui.label(format!(
-                            "总耗时: {:.2}s  平均速度: {:.0} pwd/s",
-                            r.elapsed_secs, r.speed
+                            "总耗时: {:.2}s  共检查: {}  平均速度: {:.0} pwd/s",
+                            r.elapsed_secs, r.checked_count, r.speed
                         ));
                     }
 
-                    // 日志
                     if !rs.log.is_empty() {
                         ui.separator();
                         egui::ScrollArea::vertical()
@@ -217,62 +389,11 @@ impl eframe::App for RecoveryApp {
                 if let AppState::Error(ref msg) = self.state.clone() {
                     ui.colored_label(egui::Color32::RED, format!("错误: {}", msg));
                 }
-            });
-        });
-    }
-}
 
-impl RecoveryApp {
-    fn start_recovery(&mut self, ctx: egui::Context) {
-        let wallet = match self.wallet.clone() {
-            Some(w) => w,
-            None => return,
-        };
-        let dict_path = match self.dict_path.clone() {
-            Some(p) => p,
-            None => return,
-        };
-
-        self.state = AppState::Running;
-        self.progress_count = 0;
-        self.progress_speed = 0.0;
-
-        // 清空上次结果
-        {
-            let mut rs = self.run_state.lock().unwrap();
-            rs.result = None;
-            rs.log.clear();
-        }
-
-        let run_state = self.run_state.clone();
-        let progress_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let progress_speed = Arc::new(std::sync::Mutex::new(0.0f64));
-        let pc_clone = progress_count.clone();
-        let ps_clone = progress_speed.clone();
-
-        thread::spawn(move || {
-            // 读取字典
-            let content = match std::fs::read_to_string(&dict_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    let mut rs = run_state.lock().unwrap();
-                    rs.log
-                        .push(format!("读取字典失败: {}", e));
-                    return;
+                if self.state == AppState::Cancelled {
+                    ui.colored_label(egui::Color32::YELLOW, "🟡 任务已停止");
                 }
-            };
-            let passwords: Vec<String> =
-                content.lines().map(|l| l.to_string()).collect();
-
-            let checker = PasswordChecker::new(wallet);
-            let result = checker.check_passwords_parallel(&passwords, move |count, speed| {
-                pc_clone.store(count, std::sync::atomic::Ordering::Relaxed);
-                *ps_clone.lock().unwrap() = speed;
-                ctx.request_repaint();
             });
-
-            let mut rs = run_state.lock().unwrap();
-            rs.result = Some(result);
         });
     }
 }
